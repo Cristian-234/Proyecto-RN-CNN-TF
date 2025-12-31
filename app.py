@@ -1,12 +1,34 @@
 # =========================
 # IMPORTS
 # =========================
+from heatmaps import (
+    make_gradcam_heatmap,
+    activation_heatmap,
+    superimpose_heatmap
+)
 import streamlit as st
 import cv2
 import tempfile
 from PIL import Image
 import tensorflow as tf
 import numpy as np
+from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
+import av
+
+LAST_CONV_LAYER = "Conv_1"  # Ajusta según model.summary()
+
+# =========================
+# CONFIGURACIÓN DE STUN (SOLUCIONA EL ERROR DE CÁMARA)
+# =========================
+RTC_CONFIG = RTCConfiguration({
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {"urls": ["stun:stun1.l.google.com:19302"]},
+        {"urls": ["stun:stun2.l.google.com:19302"]},
+        {"urls": ["stun:stun3.l.google.com:19302"]},
+        {"urls": ["stun:stun4.l.google.com:19302"]},
+    ]
+})
 
 # =========================
 # CONFIGURACIÓN DE PÁGINA
@@ -33,7 +55,7 @@ labels = [
     'Potato___Early_blight', 'Potato___Late_blight', 'Potato___healthy',
     'Raspberry___healthy', 'Soybean___healthy', 'Squash___Powdery_mildew',
     'Strawberry___Leaf_scorch', 'Strawberry___healthy',
-    'Tomato___Bacterial_spot', 'Tomato___Early_blight', 'Tomato___Late_blight',
+    'Tomato___Bacterial_spot', 'Tomate___Early_blight', 'Tomato___Late_blight',
     'Tomato___Leaf_Mold', 'Tomato___Septoria_leaf_spot',
     'Tomato___Spider_mites Two-spotted_spider_mite', 'Tomato___Target_Spot',
     'Tomato___Tomato_Yellow_Leaf_Curl_Virus', 'Tomato___Tomato_mosaic_virus',
@@ -331,42 +353,92 @@ def process_video(video_file, model):
     col1.metric("Frames sanos", sanas)
     col2.metric("Frames enfermos", enfermas)
 
+class VideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.model = load_model()
+
+    def recv(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+
+        img_resized = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
+        img_norm = img_resized / 255.0
+        img_input = np.expand_dims(img_norm, axis=0)
+
+        pred = self.model.predict(img_input, verbose=0)
+        label = np.argmax(pred)
+        confidence = np.max(pred) * 100
+
+        if "healthy" in labels[label]:
+            text = f"SANA ({confidence:.1f}%)"
+            color = (0, 255, 0)
+        else:
+            text = f"ENFERMA ({confidence:.1f}%)"
+            color = (0, 0, 255)
+
+        cv2.putText(img, text, (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+        cv2.rectangle(img, (10, 10), (img.shape[1]-10, img.shape[0]-10), color, 2)
+
+        return av.VideoFrame.from_ndarray(img, format="bgr24")
+
 # =========================
 # APP PRINCIPAL
 # =========================
 def main():
-
     st.markdown("""
     <h1 style='text-align:center; color:#2e7d32;'>🌱 Sistema Inteligente de Detección de Enfermedades en Plantas</h1>
     <h4 style='text-align:center;'>Deep Learning aplicado a la agricultura</h4>
     <hr>
     """, unsafe_allow_html=True)
 
-    # Sidebar
+    # =========================
+    # SIDEBAR
+    # =========================
     st.sidebar.title("📋 Panel de Control")
-    opcion = st.sidebar.radio("Modo de análisis", ("Imagen", "Video"))
+    opcion = st.sidebar.radio(
+        "Modo de análisis",
+        ("Imagen", "Video", "Cámara en tiempo real")
+    )
 
     st.sidebar.markdown("### 🌿 Cultivos soportados")
-    st.sidebar.write("Manzana, Maíz, Uva, Tomate, Papa, Fresa, Cítricos, Pimiento")
+    st.sidebar.write(
+        "Manzana, Maíz, Uva, Tomate, Papa, Fresa, Cítricos, Pimiento"
+    )
 
     model = load_model()
 
+    # =========================
+    # MODO IMAGEN
+    # =========================
     if opcion == "Imagen":
-        file = st.file_uploader("📷 Carga una imagen", type=["jpg", "png", "jpeg"])
-        if file:
-            image = Image.open(file)
-            st.image(image, use_column_width=True)
+        file = st.file_uploader(
+            "📷 Carga una imagen",
+            type=["jpg", "png", "jpeg"]
+        )
 
+        if file:
+            image = Image.open(file).convert("RGB")
+            st.image(image, width="stretch")
+
+
+            # =========================
+            # PREDICCIÓN
+            # =========================
             img = process_image_pil(image)
-            pred = model.predict(img)
+            pred = model.predict(img, verbose=0)
+
             label = np.argmax(pred)
             confidence = np.max(pred) * 100
+            estado = "Sana" if "healthy" in labels[label] else "Enferma"
 
             col1, col2, col3 = st.columns(3)
-            col1.metric("Estado", "Sana" if "healthy" in labels[label] else "Enferma")
+            col1.metric("Estado", estado)
             col2.metric("Confianza", f"{confidence:.2f}%")
             col3.metric("Clase", traducciones[label])
 
+            # =========================
+            # INFO AGRONÓMICA
+            # =========================
             key = labels[label]
             if key in info_enfermedades:
                 st.subheader("📖 Información agronómica")
@@ -374,11 +446,66 @@ def main():
                 st.write(f"**Descripción:** {info_enfermedades[key]['descripcion']}")
                 st.write(f"**Recomendación:** {info_enfermedades[key]['recomendacion']}")
 
-    else:
-        video = st.file_uploader("🎥 Carga un video", type=["mp4", "avi", "mov"])
+            # =========================
+            # MAPAS DE CALOR
+            # =========================
+            if estado == "Enferma":
+                st.subheader("🔥 Interpretabilidad del modelo")
+
+                original = np.array(image)
+
+                gradcam = make_gradcam_heatmap(img, model)
+                actmap = activation_heatmap(img, model)
+
+                gradcam_img = superimpose_heatmap(gradcam, original)
+                actmap_img = superimpose_heatmap(actmap, original)
+
+                col1, col2 = st.columns(2)
+                col1.image(
+                    gradcam_img,
+                    caption="Grad-CAM (Regiones relevantes)",
+                    width="stretch"
+                )
+
+                col2.image(
+                    actmap_img,
+                    caption="Mapa de activación (Verificación)",
+                    width="stretch"
+                )
+
+    # =========================
+    # MODO VIDEO
+    # =========================
+    elif opcion == "Video":
+        video = st.file_uploader(
+            "🎥 Carga un video",
+            type=["mp4", "avi", "mov"]
+        )
+
         if video:
             st.info("Procesando video...")
             process_video(video, model)
+
+    # =========================
+    # MODO CÁMARA EN TIEMPO REAL
+    # =========================
+    elif opcion == "Cámara en tiempo real":
+        st.subheader("🎦 Detección en tiempo real")
+        st.info(
+            "Permite el acceso a tu cámara para detectar enfermedades en tiempo real."
+        )
+
+        webrtc_streamer(
+            key="deteccion-plantas",
+            video_processor_factory=VideoProcessor,
+            rtc_configuration=RTC_CONFIG,
+            media_stream_constraints={
+                "video": True,
+                "audio": False
+            },
+            async_processing=True
+        )
+
 
 if __name__ == "__main__":
     main()
